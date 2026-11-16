@@ -47,8 +47,10 @@ def eg1():
 
     lsh1.merge(lsh2)
     print("Does m1 exist in the lsh1...", "m1" in lsh1.keys)
-    # if check_overlap flag is set to True then it will check the overlapping of the keys in the two MinHashLSH
-    lsh1.merge(lsh2,check_overlap=True)
+    # on_conflict="error" (equivalent to check_overlap=True) raises when the
+    # two indexes share keys; other choices are "keep_local" (default) and
+    # "use_source".
+    lsh1.merge(lsh2, check_overlap=True)
 
 def eg2():
     mg = WeightedMinHashGenerator(10, 5)

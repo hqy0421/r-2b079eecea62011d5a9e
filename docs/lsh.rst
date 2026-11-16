@@ -70,6 +70,47 @@ useful in parallel processing:
     # This merges the lsh1 with lsh2.
     lsh1.merge(lsh2)
 
+When the two indexes contain the same key, the conflict is resolved by
+the ``on_conflict`` argument:
+
+- ``on_conflict="keep_local"`` (the default): the local record wins,
+  only source-only keys are added.
+- ``on_conflict="use_source"``: the source record replaces the local
+  one, including all bucket memberships, so no stale candidates remain.
+- ``on_conflict="error"`` (equivalent to the legacy
+  ``check_overlap=True``): a ``ValueError`` is raised and the local
+  index is left untouched. The source index is never modified.
+
+Merging is applied atomically: a failure leaves the local index in its
+previous state.
+
+Correcting and deleting records
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Collection records often arrive repeatedly under the same key. Calling
+``insert`` again with an existing key raises, and deleting after a manual
+merge can leave stale candidates behind. The ``correction_batch`` method
+returns an atomic batch of record corrections supporting overwrites
+(``upsert``) and deletes (``remove``):
+
+.. code:: python
+
+    with lsh.correction_batch() as batch:
+        batch.upsert("record-1", corrected_minhash)  # overwrite or insert
+        batch.upsert("record-2", another_minhash)
+        batch.remove("record-3")
+        batch.commit()
+
+Corrections touching the same key are applied in input order, so the
+last one determines the final state. All validation happens while
+staging, and the commit replays every storage mutation with an inverse
+operation journaled alongside it: either the whole batch takes effect or
+the index is restored exactly to its previous state. After a successful
+commit, ``query``, ``key in lsh`` and ``remove`` all observe the same
+current records -- an overwrite removes the key from every old bucket
+before adding it to the new ones. Leaving the ``with`` block without
+calling ``commit`` discards the staged corrections.
+
 MinHash LSH does not support top-k queries -- see
 :ref:`minhash_lsh_forest` for that. And if your goal is finding sets
 with high *intersection* with the query rather than high Jaccard

@@ -13,7 +13,13 @@ from datasketch.hashfunc import sha1_hash32, sha1_hash64
 from datasketch.hnsw import HNSW
 from datasketch.hyperloglog import HyperLogLog, HyperLogLogPlusPlus
 from datasketch.lean_minhash import LeanMinHash
-from datasketch.lsh import MinHashLSH
+from datasketch.lsh import (
+    MERGE_CONFLICT_ERROR,
+    MERGE_CONFLICT_KEEP_LOCAL,
+    MERGE_CONFLICT_USE_SOURCE,
+    MinHashLSH,
+    MinHashLSHCorrectionBatch,
+)
 from datasketch.lsh_bloom import MinHashLSHBloom
 from datasketch.lshensemble import MinHashLSHEnsemble
 from datasketch.lshforest import MinHashLSHForest
@@ -26,6 +32,9 @@ WeightedMinHashLSHForest = MinHashLSHForest
 
 __all__ = [
     "HNSW",
+    "MERGE_CONFLICT_ERROR",
+    "MERGE_CONFLICT_KEEP_LOCAL",
+    "MERGE_CONFLICT_USE_SOURCE",
     "AsyncMinHashLSH",
     "HyperLogLog",
     "HyperLogLogPlusPlus",
@@ -33,6 +42,7 @@ __all__ = [
     "MinHash",
     "MinHashLSH",
     "MinHashLSHBloom",
+    "MinHashLSHCorrectionBatch",
     "MinHashLSHEnsemble",
     "MinHashLSHForest",
     "WeightedMinHash",

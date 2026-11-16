@@ -17,6 +17,16 @@ from datasketch.storage import (
 )
 from datasketch.weighted_minhash import WeightedMinHash
 
+# Conflict resolution policies for :meth:`MinHashLSH.merge`.
+MERGE_CONFLICT_ERROR = "error"
+MERGE_CONFLICT_KEEP_LOCAL = "keep_local"
+MERGE_CONFLICT_USE_SOURCE = "use_source"
+_VALID_MERGE_CONFLICT_POLICIES = (
+    MERGE_CONFLICT_ERROR,
+    MERGE_CONFLICT_KEEP_LOCAL,
+    MERGE_CONFLICT_USE_SOURCE,
+)
+
 
 def _false_positive_probability(threshold, b, r):
     _probability = lambda s: 1 - (1 - s ** float(r)) ** float(b)
@@ -234,7 +244,12 @@ class MinHashLSH:
         """
         self._insert(key, minhash, check_duplication=check_duplication, buffer=False)
 
-    def merge(self, other: MinHashLSH, check_overlap: bool = False):
+    def merge(
+        self,
+        other: MinHashLSH,
+        check_overlap: bool = False,
+        on_conflict: Optional[str] = MERGE_CONFLICT_KEEP_LOCAL,
+    ):
         """Merge the other MinHashLSH with this one, making this one the union
         of both.
 
@@ -245,16 +260,39 @@ class MinHashLSH:
             effective index parameters are equivalent.
 
         Args:
-            other (MinHashLSH): The other MinHashLSH.
-            check_overlap (bool): Check if there are any overlapping keys before merging and raise if there are any.
-                (`default=False`)
+            other (MinHashLSH): The other MinHashLSH. It is never modified.
+            check_overlap (bool): Check if there are any overlapping keys before
+                merging and raise if there are any. (`default=False`)
+                Equivalent to ``on_conflict="error"``; it is an error to pass
+                ``check_overlap=True`` together with any other ``on_conflict``
+                policy.
+            on_conflict (Optional[str]): How to resolve keys present in both
+                indexes. One of:
+
+                * :data:`MERGE_CONFLICT_ERROR` (``"error"``): raise a
+                  :class:`ValueError` when an overlapping key exists, without
+                  changing this index.
+                * :data:`MERGE_CONFLICT_KEEP_LOCAL` (``"keep_local"``, the
+                  default): keep this index's record for overlapping keys and
+                  only add keys that exist solely in the other index.
+                * :data:`MERGE_CONFLICT_USE_SOURCE` (``"use_source"``): replace
+                  this index's record of every overlapping key with the other
+                  index's record. Old bucket memberships are removed cleanly, so
+                  a later :meth:`query`, ``key in lsh`` and :meth:`remove` all
+                  see the source record and no stale candidates remain.
+
+                The merge is applied atomically: any failure leaves this index
+                untouched. The source index ``other`` is never modified.
 
         Raises:
             ValueError: If the two MinHashLSH have different initialization
-                parameters, or if `check_overlap` is `True` and there are overlapping keys.
+                parameters or incompatible MinHash schemes, if both
+                ``check_overlap`` and ``on_conflict`` are given in conflicting
+                ways, or if an overlapping key exists under the
+                :data:`MERGE_CONFLICT_ERROR` policy.
 
         """
-        self._merge(other, check_overlap=check_overlap, buffer=False)
+        self._merge(other, check_overlap=check_overlap, on_conflict=on_conflict)
 
     def insertion_session(self, buffer_size: int = 50000) -> MinHashLSHInsertionSession:
         """Create a context manager for fast insertion into this index.
@@ -329,6 +367,50 @@ class MinHashLSH:
         """
         return MinHashLSHDeletionSession(self, buffer_size=buffer_size)
 
+    def correction_batch(self) -> MinHashLSHCorrectionBatch:
+        """Create a batch of atomic record corrections (overwrites and deletes).
+
+        The batch stages corrections and applies them all at once on
+        :meth:`MinHashLSHCorrectionBatch.commit`. Corrections are validated
+        while staging, so a commit either applies the whole batch or raises
+        without changing a single stored record. On a successful commit,
+        :meth:`query`, ``key in lsh`` and :meth:`remove` all reflect the same
+        current records.
+
+        Returns:
+            MinHashLSHCorrectionBatch: The correction batch, usable as a context
+            manager. Exiting the context manager without committing discards the
+            staged corrections.
+
+        Example:
+            Correct and delete records atomically:
+
+            .. code-block:: python
+
+                with lsh.correction_batch() as batch:
+                    batch.upsert("record-1", corrected_minhash)
+                    batch.upsert("record-2", another_minhash)
+                    batch.remove("record-3")
+                    batch.commit()
+
+        """
+        return MinHashLSHCorrectionBatch(self)
+
+    def _prepare_key(self, key: Hashable) -> Hashable:
+        """Validate and serialize a user-provided key to its storage form."""
+        if self._require_bytes_keys and not isinstance(key, bytes):
+            raise TypeError(
+                f"prepickle=False requires bytes keys for non-dict storage, got {type(key).__name__}. "
+                "Either pass bytes keys or use prepickle=True for automatic serialization."
+            )
+        if self.prepickle:
+            key = pickle.dumps(key)
+        return key
+
+    def _band_hashes(self, minhash: Union[MinHash, WeightedMinHash]) -> list:
+        """Compute the per-band bucket hashes of a MinHash."""
+        return [self._H(minhash.hashvalues[start:end]) for start, end in self.hashranges]
+
     def _insert(
         self,
         key: Hashable,
@@ -339,16 +421,10 @@ class MinHashLSH:
         if len(minhash) != self.h:
             raise ValueError("Expecting minhash with length %d, got %d" % (self.h, len(minhash)))
         self._minhash_scheme = _check_scheme_consistency(getattr(self, "_minhash_scheme", None), minhash)
-        if self._require_bytes_keys and not isinstance(key, bytes):
-            raise TypeError(
-                f"prepickle=False requires bytes keys for non-dict storage, got {type(key).__name__}. "
-                "Either pass bytes keys or use prepickle=True for automatic serialization."
-            )
-        if self.prepickle:
-            key = pickle.dumps(key)
+        key = self._prepare_key(key)
         if check_duplication and key in self.keys:
             raise ValueError("The given key already exists")
-        Hs = [self._H(minhash.hashvalues[start:end]) for start, end in self.hashranges]
+        Hs = self._band_hashes(minhash)
         self.keys.insert(key, *Hs, buffer=buffer)
         for H, hashtable in zip(Hs, self.hashtables):
             hashtable.insert(H, key, buffer=buffer)
@@ -368,27 +444,53 @@ class MinHashLSH:
             and self._require_bytes_keys == other._require_bytes_keys
         )
 
-    def _merge(self, other: MinHashLSH, check_overlap: bool = False, buffer: bool = False) -> None:
-        if self.__equivalent(other):
-            known, other_known = getattr(self, "_minhash_scheme", None), getattr(other, "_minhash_scheme", None)
-            if known is not None and other_known is not None and known != other_known:
-                raise ValueError(
-                    "Cannot merge MinHashLSH indexed with MinHash scheme %r into one indexed with scheme %r"
-                    % (other_known, known)
-                )
-            if check_overlap and set(self.keys).intersection(set(other.keys)):
-                raise ValueError("The keys are overlapping, duplicate key exists.")
-            if known is None:
-                self._minhash_scheme = other_known
-            for key in other.keys:
-                Hs = other.keys.get(key)
-                self.keys.insert(key, *Hs, buffer=buffer)
-                for H, hashtable in zip(Hs, self.hashtables):
-                    hashtable.insert(H, key, buffer=buffer)
-        else:
+    def _merge(
+        self,
+        other: MinHashLSH,
+        check_overlap: bool = False,
+        on_conflict: Optional[str] = MERGE_CONFLICT_KEEP_LOCAL,
+    ) -> None:
+        if not self.__equivalent(other):
             if type(self) is not type(other):
                 raise ValueError(f"Cannot merge type MinHashLSH and type {type(other).__name__}.")
             raise ValueError("Cannot merge MinHashLSH with different initialization parameters.")
+        if check_overlap:
+            if on_conflict not in (None, MERGE_CONFLICT_ERROR):
+                raise ValueError(
+                    "check_overlap=True is equivalent to on_conflict=%r and cannot be combined "
+                    "with on_conflict=%r" % (MERGE_CONFLICT_ERROR, on_conflict)
+                )
+            on_conflict = MERGE_CONFLICT_ERROR
+        if on_conflict is None:
+            on_conflict = MERGE_CONFLICT_KEEP_LOCAL
+        if on_conflict not in _VALID_MERGE_CONFLICT_POLICIES:
+            raise ValueError("on_conflict must be one of %r, got %r" % (_VALID_MERGE_CONFLICT_POLICIES, on_conflict))
+
+        known, other_known = getattr(self, "_minhash_scheme", None), getattr(other, "_minhash_scheme", None)
+        if known is not None and other_known is not None and known != other_known:
+            raise ValueError(
+                "Cannot merge MinHashLSH indexed with MinHash scheme %r into one indexed with scheme %r"
+                % (other_known, known)
+            )
+
+        # Pre-scan for overlapping keys. Everything below this point must be
+        # applied atomically by the correction batch, so erroring here keeps
+        # the index untouched and leaves the source index unaffected.
+        if on_conflict == MERGE_CONFLICT_ERROR:
+            overlapping = set(self.keys).intersection(set(other.keys))
+            if overlapping:
+                raise ValueError("The keys are overlapping, duplicate key exists.")
+
+        batch = MinHashLSHCorrectionBatch(self, scheme=known or other_known)
+        for key in other.keys:
+            Hs = other.keys.get(key)
+            if key in self.keys and on_conflict == MERGE_CONFLICT_KEEP_LOCAL:
+                continue
+            # New keys ("error" guarantees none overlap; "keep_local" skips
+            # them above) and replaced keys are both expressed as staged
+            # corrections, so overwrites remove stale bucket memberships.
+            batch._stage_hashes(key, list(Hs))
+        batch.commit()
 
     def query(self, minhash) -> list[Hashable]:
         """Giving the MinHash of the query set, retrieve
@@ -613,6 +715,254 @@ class MinHashLSH:
             for H, hashtable in zip(Hs, hashtables):
                 hashtable.insert(H, key)
         return [hashtable.itemcounts() for hashtable in hashtables]
+
+
+class MinHashLSHCorrectionBatch:
+    """An atomic batch of record corrections (overwrites and deletes) for a
+    :class:`MinHashLSH`.
+
+    Create one with :meth:`MinHashLSH.correction_batch`. Corrections are staged
+    in memory first and only touch the index when :meth:`commit` is called. All
+    validation happens while staging, so a commit either applies every staged
+    correction or fails without changing the index at all. When several
+    corrections target the same key, they are applied in input order and the
+    last one determines the key's final state.
+
+    On a successful commit, :meth:`MinHashLSH.query`, ``key in lsh`` and
+    :meth:`MinHashLSH.remove` all reflect the same current records: an
+    overwrite removes the key from every old bucket before adding it to the new
+    ones, leaving no stale candidates behind.
+
+    The batch can be used as a context manager. Leaving the ``with`` block
+    without calling :meth:`commit` discards all staged corrections.
+
+    Args:
+        lsh (MinHashLSH): The index the corrections will be applied to.
+        scheme (Optional[str]): Internal use only -- the MinHash permutation
+            scheme to remember on commit when the index has not seen a MinHash
+            yet. Public callers leave this unset.
+
+    Example:
+
+        .. code-block:: python
+
+            with lsh.correction_batch() as batch:
+                batch.upsert("record-1", corrected_minhash)
+                batch.remove("record-2")
+                batch.commit()
+
+    """
+
+    # Sentinel marking a staged correction that deletes the key.
+    _DELETE = object()
+
+    def __init__(self, lsh: MinHashLSH, scheme: Optional[str] = None):
+        self.lsh = lsh
+        # Storage-level key -> list of per-band bucket hashes, or _DELETE.
+        self._staged: dict = {}
+        self._closed = False
+        # Scheme learned from staged MinHashes; validated against the index on
+        # commit so merely staging a wrong-scheme sketch cannot mutate the index.
+        self._scheme = scheme
+
+    def __enter__(self) -> MinHashLSHCorrectionBatch:
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        # An uncommitted batch leaves the index untouched.
+        if not self._closed:
+            self.discard()
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("This correction batch has already been committed or discarded")
+
+    def _stage_hashes(self, storage_key: Hashable, Hs: list) -> None:
+        """Stage a precomputed overwrite using storage-level key and hashes.
+
+        Internal entry point used by :meth:`MinHashLSH._merge`, where the
+        source index already stores serialized keys and band hashes.
+        """
+        self._ensure_open()
+        self._staged[storage_key] = Hs
+
+    def upsert(self, key: Hashable, minhash: Union[MinHash, WeightedMinHash]) -> None:
+        """Stage an overwrite (or insertion) of ``key`` with ``minhash``.
+
+        If the key is already indexed, its record is replaced on commit -- the
+        old bucket memberships are removed and the new MinHash is the only
+        record visible to queries. If it is not indexed, this behaves like an
+        insertion. The same key may be corrected several times within one
+        batch; corrections take effect in input order.
+
+        Args:
+            key (Hashable): The unique identifier of the set.
+            minhash (Union[MinHash, WeightedMinHash]): The corrected MinHash.
+
+        Raises:
+            ValueError: If the MinHash has the wrong number of permutations or
+                a different permutation scheme than the index.
+            TypeError: If the key does not satisfy the index's key requirements.
+
+        """
+        self._ensure_open()
+        if len(minhash) != self.lsh.h:
+            raise ValueError("Expecting minhash with length %d, got %d" % (self.lsh.h, len(minhash)))
+        self._scheme = _check_scheme_consistency(self._scheme, minhash)
+        storage_key = self.lsh._prepare_key(key)
+        self._staged[storage_key] = self.lsh._band_hashes(minhash)
+
+    def remove(self, key: Hashable) -> None:
+        """Stage the deletion of ``key`` from the index.
+
+        A staged deletion of a key that is neither indexed nor staged for
+        insertion raises immediately, mirroring :meth:`MinHashLSH.remove`. A
+        key staged for overwrite within the same batch can be deleted again;
+        the last correction in input order wins.
+
+        Args:
+            key (Hashable): The unique identifier of the set.
+
+        Raises:
+            ValueError: If the key does not exist in the index and has no
+                staged correction in this batch.
+            TypeError: If the key does not satisfy the index's key requirements.
+
+        """
+        self._ensure_open()
+        storage_key = self.lsh._prepare_key(key)
+        if storage_key not in self.lsh.keys and storage_key not in self._staged:
+            raise ValueError("The given key does not exist")
+        self._staged[storage_key] = self._DELETE
+
+    def commit(self) -> None:
+        """Apply all staged corrections atomically.
+
+        Every correction is validated before the index is touched. The commit
+        replays the corrections in staging order while recording inverse
+        operations; if any storage operation fails, the inverses are replayed
+        to restore the exact pre-commit state before the exception is raised.
+        With the in-memory ``dict`` storage backend this guarantees the whole
+        batch either succeeds or has no effect.
+
+        Raises:
+            ValueError: If a staged MinHash uses a different permutation scheme
+                than the MinHashes already indexed.
+            RuntimeError: If the batch was already committed or discarded.
+
+        """
+        self._ensure_open()
+        known_scheme = getattr(self.lsh, "_minhash_scheme", None)
+        if known_scheme is not None and self._scheme is not None and known_scheme != self._scheme:
+            raise ValueError(
+                "MinHash scheme %r does not match scheme %r of the MinHash previously given to this index"
+                % (self._scheme, known_scheme)
+            )
+
+        undo_journal: list = []
+        try:
+            for storage_key, Hs in self._staged.items():
+                if Hs is self._DELETE:
+                    self._apply_delete(storage_key, undo_journal)
+                else:
+                    self._apply_upsert(storage_key, Hs, undo_journal)
+        except BaseException:
+            for inverse in reversed(undo_journal):
+                inverse()
+            raise
+        if known_scheme is None:
+            self.lsh._minhash_scheme = self._scheme
+        self._closed = True
+
+    def discard(self) -> None:
+        """Drop every staged correction without touching the index."""
+        self._staged.clear()
+        self._closed = True
+
+    def _record(self, undo_journal: list, mutation, inverse) -> None:
+        """Run one storage mutation and remember how to undo it immediately."""
+        mutation()
+        undo_journal.append(inverse)
+
+    def _apply_upsert(self, storage_key: Hashable, Hs: list, undo_journal: list) -> None:
+        lsh = self.lsh
+        if storage_key in lsh.keys:
+            old_Hs = list(lsh.keys.get(storage_key))
+            if old_Hs == Hs:
+                # The record is already identical: nothing to do, nothing to undo.
+                return
+            # Remove every old bucket membership. Empty buckets are dropped,
+            # exactly as MinHashLSH._remove does. Each step is journaled so a
+            # failure halfway through still restores the complete old record.
+            for old_H, hashtable in zip(old_Hs, lsh.hashtables):
+
+                def remove_membership(h=old_H, table=hashtable):
+                    table.remove_val(h, storage_key)
+                    if not table.get(h):
+                        table.remove(h)
+
+                def restore_membership(h=old_H, table=hashtable):
+                    table.insert(h, storage_key)
+
+                self._record(undo_journal, remove_membership, restore_membership)
+            self._record(
+                undo_journal,
+                lambda: lsh.keys.remove(storage_key),
+                lambda hashes=old_Hs: lsh.keys.insert(storage_key, *hashes),
+            )
+        else:
+            # New key: failure before the new record is fully written must not
+            # leave a partial entry behind.
+            self._record(
+                undo_journal,
+                lambda: lsh.keys.insert(storage_key, *Hs),
+                lambda: lsh.keys.remove(storage_key) if storage_key in lsh.keys else None,
+            )
+            for H, hashtable in zip(Hs, lsh.hashtables):
+                self._record(
+                    undo_journal,
+                    lambda h=H, table=hashtable: table.insert(h, storage_key),
+                    lambda h=H, table=hashtable: self._remove_membership(table, h, storage_key),
+                )
+            return
+
+        # Existing key: write the replacement record, step by step.
+        self._record(
+            undo_journal,
+            lambda: lsh.keys.insert(storage_key, *Hs),
+            lambda: lsh.keys.remove(storage_key),
+        )
+        for H, hashtable in zip(Hs, lsh.hashtables):
+            self._record(
+                undo_journal,
+                lambda h=H, table=hashtable: table.insert(h, storage_key),
+                lambda h=H, table=hashtable: self._remove_membership(table, h, storage_key),
+            )
+
+    @staticmethod
+    def _remove_membership(hashtable, H, storage_key) -> None:
+        hashtable.remove_val(H, storage_key)
+        if not hashtable.get(H):
+            hashtable.remove(H)
+
+    def _apply_delete(self, storage_key: Hashable, undo_journal: list) -> None:
+        lsh = self.lsh
+        # The key was validated at staging time; an earlier correction in this
+        # same batch may still have removed it.
+        if storage_key not in lsh.keys:
+            return
+        old_Hs = list(lsh.keys.get(storage_key))
+        for H, hashtable in zip(old_Hs, lsh.hashtables):
+            self._record(
+                undo_journal,
+                lambda h=H, table=hashtable: self._remove_membership(table, h, storage_key),
+                lambda h=H, table=hashtable: table.insert(h, storage_key),
+            )
+        self._record(
+            undo_journal,
+            lambda: lsh.keys.remove(storage_key),
+            lambda hashes=old_Hs: lsh.keys.insert(storage_key, *hashes),
+        )
 
 
 class MinHashLSHInsertionSession:
